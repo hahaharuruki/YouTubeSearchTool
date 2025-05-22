@@ -59,25 +59,52 @@ def transcribe_audio(audio_path):
     return chunks
 
 # ========== 3. 埋め込み（ベクトル化） ==========
-def embed_texts(segments):
-    from transformers import AutoTokenizer, AutoModel
+def embed_text(text):
     import torch
-
-    tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-large-en-v1.5")
-    model = AutoModel.from_pretrained("BAAI/bge-large-en-v1.5")
-
-    texts = [seg["text"] for seg in segments]
-    print("🔢 テキストをベクトル化中...")
-
-    embeddings = []
-    for text in texts:
-        inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
+    from transformers import AutoTokenizer, AutoModel
+    
+    # モデルの組み合わせ（重み付け）
+    models = [
+        ("BAAI/bge-large-en-v1.5", 0.6),  # 基本モデル
+        ("intfloat/multilingual-e5-large", 0.4)  # 日本語対応補完
+    ]
+    
+    final_embedding = None
+    device = torch.device("cpu")  # MPSは不安定なのでCPU推奨
+    
+    for model_name, weight in models:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModel.from_pretrained(model_name).to(device)
+        
+        inputs = tokenizer(
+            text, 
+            return_tensors="pt", 
+            truncation=True, 
+            max_length=512, 
+            padding=True
+        ).to(device)
+        
         with torch.no_grad():
-            model_output = model(**inputs)
-        sentence_embedding = model_output.last_hidden_state[:, 0]
-        embeddings.append(sentence_embedding.squeeze().numpy())
-
-    return embeddings
+            outputs = model(**inputs)
+            embedding = outputs.last_hidden_state[:, 0].cpu().numpy()
+        
+        if final_embedding is None:
+            final_embedding = embedding * weight
+        else:
+            # 次元が異なる場合の調整（必要に応じて）
+            if embedding.shape != final_embedding.shape:
+                from sklearn.preprocessing import normalize
+                # リサイズして正規化
+                embedding = normalize(embedding).reshape(final_embedding.shape)
+            
+            final_embedding += embedding * weight
+        
+        # メモリ解放
+        del model, tokenizer
+        import gc
+        gc.collect()
+    
+    return final_embedding
 
 # ========== 4. FAISS に格納 ==========
 def save_to_faiss(embeddings, segments, index_path="faiss.index", meta_path="metadata.json"):
@@ -136,5 +163,91 @@ if __name__ == "__main__":
     url = sys.argv[1]
     download_audio(url)
     segments = transcribe_audio("output.mp3")
-    embeddings = embed_texts(segments)
-    save_to_faiss(np.array(embeddings).astype("float32"), segments)
+    embeddings = [embed_text(seg["text"]).squeeze() for seg in segments]
+    embeddings = np.stack(embeddings).astype("float32")
+    save_to_faiss(embeddings, segments)
+
+# Silero VADへ変更（精度向上）
+def get_vad_segments(audio_path):
+    import torch
+    model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad',
+                                 model='silero_vad',
+                                 force_reload=True)
+    (get_speech_timestamps, _, _, _, _) = utils
+    
+    # オーディオの読み込み（16kHz、モノラル化）
+    import librosa
+    audio, sr = librosa.load(audio_path, sr=16000, mono=True)
+    
+    # 音声区間の検出
+    speech_timestamps = get_speech_timestamps(
+        torch.tensor(audio),
+        model,
+        threshold=0.5,  # 感度調整（0.3-0.7の間で調整可能）
+        sampling_rate=16000
+    )
+    
+    return speech_timestamps
+
+# HNSWインデックスへの変更（精度と速度のバランス）
+def create_improved_index(embeddings):
+    import faiss
+    import numpy as np
+    
+    dim = embeddings.shape[1]
+    
+    # HNSWインデックスの構築
+    # M: グラフの次数（高いほど精度向上だがメモリ消費増加）
+    # efConstruction: 構築時の探索幅（高いほど精度向上だが構築時間増加）
+    index = faiss.IndexHNSWFlat(dim, M=32)
+    index.hnsw.efConstruction = 80  # 構築時の探索幅
+    index.hnsw.efSearch = 128  # 検索時の探索幅（高いほど精度向上）
+    
+    # 埋め込みを追加
+    if len(embeddings) > 0:
+        faiss.normalize_L2(embeddings)  # コサイン類似度のための正規化
+        index.add(embeddings)
+    
+    return index
+
+# クロスエンコーダーでリランキング（精度向上）
+def rerank_results(query, results, metadata, top_k=5):
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+    import torch
+    
+    # 多言語クロスエンコーダー
+    model_name = "amberoad/bert-multilingual-passage-reranking-msmarco"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(model_name)
+    
+    pairs = []
+    ids = []
+    
+    for idx in results:
+        if idx >= 0 and idx < len(metadata):
+            text = metadata[idx]["text"]
+            pairs.append([query, text])
+            ids.append(idx)
+    
+    # バッチサイズを小さくして処理
+    batch_size = 4
+    scores = []
+    
+    for i in range(0, len(pairs), batch_size):
+        batch = pairs[i:i+batch_size]
+        inputs = tokenizer(
+            batch, 
+            padding=True, 
+            truncation=True, 
+            return_tensors="pt", 
+            max_length=512
+        )
+        
+        with torch.no_grad():
+            outputs = model(**inputs)
+            batch_scores = outputs.logits.squeeze(-1).tolist()
+            scores.extend(batch_scores)
+    
+    # スコアと元のインデックスでソート
+    scored_results = sorted(zip(ids, scores), key=lambda x: x[1], reverse=True)
+    return [idx for idx, _ in scored_results[:top_k]]

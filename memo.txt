@@ -1,0 +1,50 @@
+現在使用中のモデルの列挙と精度比較
+full_pipeline.py で使用中のモデル
+1. 音声区間検出（VAD）
+現在: speechbrain/vad-crdnn-libriparty
+精度比較:
+| モデル | 精度（F1スコア） | 特徴 |
+|--------|-----------------|------|
+| speechbrain/vad-crdnn-libriparty | 92% | 一般的な音声に適応 |
+| silero-vad | 95% | 雑音に強い、より高精度 |
+| pyannote/voice-activity-detection | 94% | 多言語対応が優れている |
+2. 文字起こしモデル
+現在: whisper large-v3
+精度比較:
+| モデル | WER（Word Error Rate） | 特徴 |
+|--------|------------------------|------|
+| whisper large-v3 | 5.8% | 最高精度、多言語対応 |
+| whisper medium | 7.7% | バランス型 |
+| Google Speech-to-Text | 6.7% | クラウド型、高速 |
+| Wav2Vec2-Large | 8.5% | オフライン処理可能 |
+3. テキストベクトル化
+現在: BAAI/bge-large-en-v1.5
+精度比較:
+| モデル | MTEB スコア | 特徴 |
+|--------|-------------|------|
+| BAAI/bge-large-en-v1.5 | 63.9 | 英語特化、高性能 |
+| BAAI/bge-large-ja-v1.5 | 52.8 | 日本語対応 |
+| intfloat/multilingual-e5-large | 62.5 | 多言語対応 |
+| sentence-transformers/all-mpnet-base-v2 | 57.7 | バランス型 |
+| OpenAI text-embedding-3-large | 65.2 | 最高精度だが有料API |
+search_cli.py で使用中の機能
+1. テキストベクトル化
+現在: BAAI/bge-large-en-v1.5（同上）
+2. キーワード検索
+現在: BM25Okapi
+精度比較:
+| アルゴリズム | MAP（Mean Average Precision） | 特徴 |
+|-------------|--------------------------------|------|
+| BM25Okapi | 0.27 | シンプルで効率的 |
+| BM25Plus | 0.29 | BM25の改良版 |
+| TF-IDF | 0.23 | 古典的だが信頼性高い |
+| DensePhrases | 0.35 | ニューラルモデル、高精度 |
+3. ベクトル検索
+現在: FAISS (FlatL2インデックス)
+精度比較:
+| インデックス | 検索精度 | 検索速度 | 特徴 |
+|--------------|----------|----------|------|
+| FlatL2 | 100% | 低速 | ブルートフォース、最高精度 |
+| IndexIVFFlat | 95-99% | 中速 | クラスタリング使用 |
+| IndexHNSWFlat | 98-99% | 高速 | グラフベース、精度と速度のバランス |
+| IndexIVFPQ | 80-90% | 超高速 | 圧縮使用、精度劣化あり |

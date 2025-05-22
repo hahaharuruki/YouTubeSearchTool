@@ -1,1 +1,4 @@
 venv/
+faiss.index
+output.mp3
+metadata.json
