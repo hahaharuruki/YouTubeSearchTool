@@ -1,4 +1,5 @@
 venv/
+env/
 faiss.index
 output.mp3
 metadata.json

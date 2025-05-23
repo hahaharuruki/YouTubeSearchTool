@@ -1,0 +1,3 @@
+[server]
+# ファイル変更の監視をオフに
+fileWatcherType = "none"

@@ -6,10 +6,31 @@ from transformers import AutoTokenizer, AutoModel
 import torch
 from rank_bm25 import BM25Okapi
 
-def embed_query(text: str) -> np.ndarray:
+def extract_video_id(url):
+    import re
+    m = re.search(r"v=([a-zA-Z0-9_\-]+)", url)
+    return m.group(1) if m else url
+
+def get_video_title(youtube_url):
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["yt-dlp", "--get-title", youtube_url],
+            capture_output=True, text=True, check=True
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ""
+
+@st.cache_resource # モデルとトークナイザーをキャッシュ
+def get_embedding_model_and_tokenizer(model_name="BAAI/bge-large-en-v1.5"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-large-en-v1.5")
-    model = AutoModel.from_pretrained("BAAI/bge-large-en-v1.5").to(device)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name).to(device)
+    return model, tokenizer, device
+
+def embed_query(text: str) -> np.ndarray:
+    model, tokenizer, device = get_embedding_model_and_tokenizer()
     inputs = tokenizer(
         text,
         return_tensors="pt",
