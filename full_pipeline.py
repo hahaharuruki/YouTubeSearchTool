@@ -1,32 +1,182 @@
+import torch
+from typing import List
+# Ensure compatibility: define get_default_device if missing
+if not hasattr(torch, "get_default_device"):
+    torch.get_default_device = lambda: torch.device("cpu")
+
 import subprocess
-import whisper
 import faiss
+import whisperx # WhisperXのインポート
 import numpy as np
 import json
 import os
 import sys
 from tqdm import tqdm
 import noisereduce as nr
-import librosa
 import soundfile as sf
-import torch
-import whisperx
 
-def extract_video_id(url):
-    import re
-    m = re.search(r"v=([a-zA-Z0-9_\-]+)", url)
-    return m.group(1) if m else url
+# Global cache for models to avoid reloading
+_vad_model_cache = None
+_vad_utils_cache = None
+# WhisperXモデル用のグローバルキャッシュ
+_whisperx_asr_model_cache = None
+_whisperx_align_model_cache = None
+_whisperx_align_metadata_cache = None
+_whisperx_diarize_pipeline_cache = None
 
-def get_video_title(youtube_url):
-    import subprocess
-    try:
-        result = subprocess.run(
-            ["yt-dlp", "--get-title", youtube_url],
-            capture_output=True, text=True, check=True
-        )
-        return result.stdout.strip()
-    except Exception:
-        return ""
+# Silero VADへ変更（精度向上）
+def get_vad_segments(audio_path_or_array, sr_target=16000):
+    global _vad_model_cache, _vad_utils_cache
+    import torch
+    import librosa
+
+    if _vad_model_cache is None or _vad_utils_cache is None:
+        print("🔊 Silero VADモデルをロード中...")
+        _vad_model_cache, _vad_utils_cache = torch.hub.load(repo_or_dir='snakers4/silero-vad',
+                                                             model='silero_vad',
+                                                             force_reload=False, # Use cached model after first download
+                                                             trust_repo=True) # Recommended for hub.load
+
+    (get_speech_timestamps, _, _, _, _) = _vad_utils_cache
+
+    if isinstance(audio_path_or_array, str):
+        # オーディオの読み込み（指定されたサンプルレート、モノラル化）
+        audio_np, sr_orig = librosa.load(audio_path_or_array, sr=None, mono=True) # Load original sr
+        if sr_orig != sr_target:
+            print(f"🎤 音声をリサンプリング中: {sr_orig}Hz -> {sr_target}Hz")
+            audio_np = librosa.resample(audio_np, orig_sr=sr_orig, target_sr=sr_target)
+        current_sr = sr_target
+    elif isinstance(audio_path_or_array, np.ndarray):
+        audio_np = audio_path_or_array
+        # Assuming if a numpy array is passed, its sample rate is sr_target
+        # This should be ensured by the caller or sr should be passed.
+        # For this pipeline, get_vad_segments is called with a path first.
+        current_sr = sr_target # Assume sr_target if ndarray
+    else:
+        raise ValueError("audio_path_or_arrayはファイルパス(str)またはNumpy配列である必要があります。")
+
+    audio_tensor = torch.from_numpy(audio_np)
+
+    # 音声区間の検出
+    speech_timestamps = get_speech_timestamps(
+        audio_tensor,
+        _vad_model_cache,
+        threshold=0.5,  # 感度調整（0.3-0.7の間で調整可能）
+        sampling_rate=current_sr # VADモデルが期待するサンプルレート
+    )
+    # speech_timestamps は current_sr でのサンプルインデックスのリスト
+    return speech_timestamps, audio_np, current_sr
+
+# ========== ノイズ除去 ==========
+def reduce_noise(audio_path: str, output_path: str):
+    """
+    音声ファイルからノイズを除去し、指定されたパスに保存する。
+    """
+    import librosa
+    print(f"🔊 ノイズ除去中: {audio_path} ...")
+    
+    # librosaで音声を読み込み (16kHzモノラルに統一)
+    audio, sr = librosa.load(audio_path, sr=16000, mono=True)
+    
+    # ノイズ除去を実行 (定常的なノイズを想定)
+    reduced_noise_audio = nr.reduce_noise(y=audio, sr=sr, stationary=True)
+    
+    # 処理後の音声を保存
+    sf.write(output_path, reduced_noise_audio, sr)
+    print(f"✅ ノイズ除去済み音声を保存しました: {output_path}")
+
+# ========== 2. Whisperで文字起こし ==========
+def transcribe_audio(audio_path: str, language_code: str = "ja") -> List[dict]:
+    """
+    WhisperXを使用して音声ファイルから文字起こしと話者分離を行う。
+    """
+    global _whisperx_asr_model_cache, _whisperx_align_model_cache, \
+           _whisperx_align_metadata_cache, _whisperx_diarize_pipeline_cache
+    
+    import torch # for device selection
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # CPUの場合、float32の方が安定または高速な場合がありますが、int8はメモリ効率が良いです
+    compute_type = "float16" if device == "cuda" else "int8" 
+    batch_size = 16 # GPUメモリに応じて調整
+
+    print(f"🚀 WhisperX (large-v3) を使用して処理開始 (device: {device}, compute_type: {compute_type})")
+
+    # 1. ASRモデルのロード
+    if _whisperx_asr_model_cache is None:
+        print(f"🤫 WhisperX ASRモデル (large-v3, lang={language_code or 'auto'}) をロード中...")
+        # language_codeがNoneの場合、WhisperXは自動検出を試みます
+        _whisperx_asr_model_cache = whisperx.load_model("large-v3", device, compute_type=compute_type, language=language_code)
+
+    # 2. 音声ファイルのロード
+    print(f"🎧 WhisperX用に音声ファイルをロード中: {audio_path}")
+    audio_input = whisperx.load_audio(audio_path) # デフォルトで16kHzにリサンプル
+
+    # 3. 文字起こし実行
+    print("📝 WhisperXで文字起こし中...")
+    result = _whisperx_asr_model_cache.transcribe(audio_input, batch_size=batch_size)
+    transcription_language = result["language"]
+    print(f"🌍 WhisperXが使用/検出した言語: {transcription_language}")
+
+    # 4. アラインメントモデルのロードと実行 (正確な単語タイムスタンプのため)
+    # アラインメントモデルは言語に依存するため、キャッシュも言語を考慮
+    if _whisperx_align_model_cache is None or \
+       _whisperx_align_metadata_cache is None or \
+       _whisperx_align_metadata_cache.get("language_code") != transcription_language:
+        print(f"🔄 WhisperX Alignモデル ({transcription_language}) をロード中...")
+        try:
+            _whisperx_align_model_cache, _whisperx_align_metadata_cache = whisperx.load_align_model(
+                language_code=transcription_language, device=device
+            )
+            # キャッシュ情報に言語コードを保存
+            if _whisperx_align_metadata_cache: # metadataがNoneでないことを確認
+                 _whisperx_align_metadata_cache["language_code"] = transcription_language
+        except Exception as e:
+            print(f"❌ Alignモデルのロードに失敗しました ({transcription_language}): {e}")
+            print("話者分離なしで処理を続行します。")
+            # アラインメント失敗時のフォールバック
+            aligned_result = {"segments": result["segments"]} # 元のセグメントを使用
+    
+    if _whisperx_align_model_cache: # アラインメントモデルが正常にロードされた場合
+        print("🔄 WhisperXでアラインメント処理中...")
+        aligned_result = whisperx.align(result["segments"], _whisperx_align_model_cache, _whisperx_align_metadata_cache, audio_input, device, return_char_alignments=False)
+    else: # アラインメントモデルのロードに失敗した場合
+        print("⚠️ アラインメントモデルが利用できないため、アラインメントをスキップします。")
+        aligned_result = {"segments": result["segments"]}
+
+    # 5. 話者分離の実行
+    final_segments_for_chunking = aligned_result["segments"]
+    hf_token = os.getenv("HF_TOKEN")
+    if not hf_token:
+        print("⚠️ Hugging Faceトークン (HF_TOKEN) が環境変数に設定されていません。話者分離はスキップされます。")
+    else:
+        if _whisperx_diarize_pipeline_cache is None:
+            print("🗣️ WhisperX Diarization パイプラインをロード中 (pyannote.audio)...")
+            from whisperx.diarize import DiarizationPipeline # 変更点
+            _whisperx_diarize_pipeline_cache = DiarizationPipeline(use_auth_token=hf_token, device=device)
+        
+        print("🗣️ WhisperXで話者分離を実行中...")
+        # DiarizationPipelineは音声ファイルパスまたはロードされたオーディオを受け取れます
+        # audio_path (ノイズ除去後のファイル) を使用するのが一般的
+        diarize_segments = _whisperx_diarize_pipeline_cache(audio_path) 
+        
+        print("🤝 話者情報を文字起こし結果に割り当て中...")
+        result_with_speakers = whisperx.assign_word_speakers(diarize_segments, aligned_result)
+        final_segments_for_chunking = result_with_speakers["segments"]
+
+    # 6. チャンクの整形
+    chunks = []
+    print("💬 文字起こし結果をチャンクに整形中...")
+    for seg in tqdm(final_segments_for_chunking, desc="チャンク整形"):
+        chunks.append({
+            "start": seg["start"],
+            "end": seg["end"],
+            "text": seg["text"].strip(),
+            "speaker": seg.get("speaker", "UNKNOWN") # 話者情報がない場合はUNKNOWN
+        })
+    
+    print(f"✅ {len(chunks)}件のチャンクに再構成しました（話者情報 {'あり' if hf_token and _whisperx_diarize_pipeline_cache else 'なし'}）")
+    return chunks
 
 # ========== 1. 動画から音声をダウンロード ==========
 def download_audio(youtube_url, output_path="output.mp3"):
@@ -44,62 +194,12 @@ def download_audio(youtube_url, output_path="output.mp3"):
     ])
     print(f"✅ 音声を保存しました: {output_path}")
 
-def denoise_audio(input_path="output.mp3", output_path="output_denoised.wav"):
-    print("🧹 ノイズ除去中...")
-    y, sr = librosa.load(input_path, sr=16000)
-    reduced_noise = nr.reduce_noise(y=y, sr=sr)
-    sf.write(output_path, reduced_noise, sr)
-    print(f"✅ ノイズ除去済み音声を保存: {output_path}")
-
-# ========== 2. WhisperXで文字起こし＋話者分離 ==========
-def transcribe_audio_with_speaker(audio_path):
-    hf_token = os.environ.get("HF_TOKEN")
-    if not hf_token:
-        # トークンが見つからない場合、ユーザーに入力を促すか、エラーメッセージを表示して終了する
-        # ここでは例としてNoneを渡すが、実際には適切なエラーハンドリングが必要
-        print("警告: Hugging Faceのアクセストークンが環境変数 HF_TOKEN に設定されていません。")
-        print("話者分離機能が正しく動作しない可能性があります。")
-        # raise ValueError("Hugging Faceのアクセストークン(HF_TOKEN)が設定されていません。") # より厳格な場合
-    print("📝 WhisperXで文字起こし＋話者分離中...")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # 1. 文字起こし実行
-    model = whisperx.load_model("large-v3", device, compute_type="float32")
-    transcription_result = model.transcribe(audio_path) # 文字起こし結果 (辞書型)
-    print(f"✅ 文字起こし完了: {len(transcription_result['segments'])}件のセグメントを取得")
-    language_code = transcription_result["language"]
-    print(f"🗣️ 検出された言語: {language_code}")
-
-    # 2. アライメントモデルのロードと実行
-    print("🔄 文字起こし結果のアライメント中...")
-    try:
-        align_model, metadata = whisperx.load_align_model(language_code=language_code, device=device)
-        aligned_result = whisperx.align(transcription_result["segments"], align_model, metadata, audio_path, device)
-        print(f"✅ アライメント完了: {len(aligned_result['segments'])}件のセグメントをアライメント")
-        # メモリ解放
-        del align_model
-        import gc
-        gc.collect()
-    except Exception as e:
-        print(f"⚠️ アライメント処理中にエラーが発生しました: {e}")
-        print("アライメントなしで処理を続行します。")
-        aligned_result = transcription_result # アライメント失敗時は元の文字起こし結果を使用
-
-    # 3. 話者分離パイプラインの準備と実行
-    diarize_model_instance = whisperx.diarize.DiarizationPipeline(device=device, use_auth_token=hf_token)
-    print("🗣️ 話者分離を実行中...")
-    # diarize_model_instance には音声ファイルパスのみを渡す
-    diarization_annotation = diarize_model_instance(audio_path)
-    # 4. アライメントされた文字起こし結果に話者情報を割り当て
-    print("🔗 文字起こし結果に話者情報を割り当て中...")
-    final_result_with_speakers = whisperx.assign_word_speakers(diarization_annotation, aligned_result)
-    segments = final_result_with_speakers["segments"]
-    print(f"✅ 話者ラベル付きセグメント数: {len(segments)}")
-    return segments
-
 # ========== 3. 埋め込み（ベクトル化） ==========
 def embed_text(text):
     import torch
+    # Ensure compatibility: define get_default_device if missing
+    if not hasattr(torch, "get_default_device"):
+        torch.get_default_device = lambda: torch.device("cpu")
     from transformers import AutoTokenizer, AutoModel
     
     # モデルの組み合わせ（重み付け）
@@ -166,49 +266,15 @@ def save_to_faiss(embeddings, segments, index_path="faiss.index", meta_path="met
     # Prepare a set of existing entries for quick lookup to avoid duplicates
     existing_set = set((m["start"], m["end"], m["text"]) for m in existing_metadata)
 
-    # Prepare a dict to map video_id to set of titles for existing metadata
-    video_titles_map = {}
-    for meta in existing_metadata:
-        vid = meta.get("video_id")
-        titles = meta.get("video_titles", [])
-        if vid:
-            if vid not in video_titles_map:
-                video_titles_map[vid] = set()
-            video_titles_map[vid].update(titles)
-
     # Filter new segments and embeddings to exclude duplicates
     new_metadata = []
     new_embeddings = []
     for seg, emb in zip(segments, embeddings):
         key = (seg["start"], seg["end"], seg["text"])
         if key not in existing_set:
-            vid = seg.get("video_id")
-            vtitle = seg.get("video_title", "")
-            # Prepare video_titles list for this segment
-            if vid:
-                old_titles = video_titles_map.get(vid, set())
-                updated_titles = set(old_titles)
-                if vtitle:
-                    updated_titles.add(vtitle)
-                seg["video_titles"] = list(updated_titles)
-                video_titles_map[vid] = updated_titles
-            else:
-                seg["video_titles"] = [vtitle] if vtitle else []
             new_metadata.append(seg)
             new_embeddings.append(emb)
             existing_set.add(key)
-        else:
-            # Even if duplicate, update video_titles in existing metadata if needed
-            for meta in existing_metadata:
-                if (meta["start"], meta["end"], meta["text"]) == key:
-                    vid = seg.get("video_id")
-                    vtitle = seg.get("video_title", "")
-                    if vid:
-                        old_titles = set(meta.get("video_titles", []))
-                        if vtitle and vtitle not in old_titles:
-                            old_titles.add(vtitle)
-                            meta["video_titles"] = list(old_titles)
-                    break
 
     if len(new_embeddings) > 0:
         new_embeddings_np = np.array(new_embeddings).astype("float32")
@@ -234,40 +300,14 @@ if __name__ == "__main__":
         sys.exit(1)
 
     url = sys.argv[1]
-    video_id = extract_video_id(url)
-    video_title = get_video_title(url)
-    download_audio(url)
-    denoise_audio("output.mp3", "output_denoised.wav")
-    segments = transcribe_audio_with_speaker("output_denoised.wav")
-    for seg in segments:
-        seg["video_id"] = video_id
-        seg["video_url"] = url
-        seg["video_title"] = video_title
-    embeddings = [embed_text(seg["text"]).squeeze() for seg in segments]
+    audio_filename = "output.mp3"
+
+    download_audio(url, output_path=audio_filename)
+    reduce_noise(audio_path=audio_filename, output_path=audio_filename) # 元のファイルを上書き
+    segments = transcribe_audio(audio_path=audio_filename, language_code="ja") # 日本語を指定
+    embeddings = [embed_text(seg["text"]).squeeze() for seg in tqdm(segments, desc="📝 テキスト埋め込み中")]
     embeddings = np.stack(embeddings).astype("float32")
     save_to_faiss(embeddings, segments)
-
-# Silero VADへ変更（精度向上）
-def get_vad_segments(audio_path):
-    import torch
-    model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad',
-                                 model='silero_vad',
-                                 force_reload=True)
-    (get_speech_timestamps, _, _, _, _) = utils
-    
-    # オーディオの読み込み（16kHz、モノラル化）
-    import librosa
-    audio, sr = librosa.load(audio_path, sr=16000, mono=True)
-    
-    # 音声区間の検出
-    speech_timestamps = get_speech_timestamps(
-        torch.tensor(audio),
-        model,
-        threshold=0.5,  # 感度調整（0.3-0.7の間で調整可能）
-        sampling_rate=16000
-    )
-    
-    return speech_timestamps
 
 # HNSWインデックスへの変更（精度と速度のバランス）
 def create_improved_index(embeddings):
