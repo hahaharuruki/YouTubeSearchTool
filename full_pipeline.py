@@ -14,6 +14,8 @@ import sys
 from tqdm import tqdm
 import noisereduce as nr
 import soundfile as sf
+import sqlalchemy as sa
+from frame_ocr import get_video_id, process_video, engine  # engineをインポート
 
 # Global cache for models to avoid reloading
 _vad_model_cache = None
@@ -293,6 +295,68 @@ def save_to_faiss(embeddings, segments, index_path="faiss.index", meta_path="met
 
     print("✅ 保存完了")
 
+# フレームOCR処理のインポート
+from frame_ocr import process_video
+
+def save_whisper_transcription_to_file(segments, video_id, output_dir="output"):
+    """WhisperXの文字起こし結果をファイルに保存する"""
+    os.makedirs(output_dir, exist_ok=True)
+    output_file = os.path.join(output_dir, f"{video_id}_whisper_transcription.txt")
+
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(f"動画ID: {video_id}\n")
+        f.write("=" * 50 + "\n\n")
+
+        for segment in segments:
+            start_time = segment["start"]
+            end_time = segment["end"]
+            text = segment["text"]
+            speaker = segment.get("speaker", "UNKNOWN")
+
+            # 時間を[MM:SS]形式に変換
+            start_minutes = int(start_time // 60)
+            start_seconds = int(start_time % 60)
+            end_minutes = int(end_time // 60)
+            end_seconds = int(end_time % 60)
+
+            # 話者情報付きで出力
+            f.write(f"[{start_minutes:02d}:{start_seconds:02d} - {end_minutes:02d}:{end_seconds:02d}] [話者: {speaker}]\n")
+            f.write(f"{text}\n\n")
+
+    print(f"✅ WhisperX文字起こしテキストを保存しました: {output_file}")
+    return output_file
+
+def save_transcription_to_file(video_id, output_dir="output"):
+    """データベースから文字起こしテキストを取得してファイルに保存する"""
+    # 出力ディレクトリの作成
+    os.makedirs(output_dir, exist_ok=True)
+    output_file = os.path.join(output_dir, f"{video_id}_transcription.txt")
+
+    # データベースから時系列順にテキストを取得
+    query = """
+        SELECT frame_timestamp, ocr_text
+        FROM video_frames
+        WHERE video_id = :video_id
+        ORDER BY frame_timestamp
+    """
+    
+    with engine.connect() as conn:
+        result = conn.execute(sa.text(query), {"video_id": video_id})
+        transcriptions = result.fetchall()
+
+    # ファイルに書き出し
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(f"動画ID: {video_id}\n")
+        f.write("=" * 50 + "\n\n")
+        
+        for timestamp, text in transcriptions:
+            minutes = int(timestamp // 60)
+            seconds = int(timestamp % 60)
+            f.write(f"[{minutes:02d}:{seconds:02d}] {text}\n")
+
+    print(f"✅ 文字起こしテキストを保存しました: {output_file}")
+    return output_file
+
 # ========== 実行フロー ==========
 if __name__ == "__main__":
     if len(sys.argv) < 2:
@@ -300,14 +364,49 @@ if __name__ == "__main__":
         sys.exit(1)
 
     url = sys.argv[1]
+    video_id = get_video_id(url)
+    if not video_id:
+        print("❌ 有効なYouTube URLではありません")
+        sys.exit(1)
+
     audio_filename = "output.mp3"
 
     download_audio(url, output_path=audio_filename)
     reduce_noise(audio_path=audio_filename, output_path=audio_filename) # 元のファイルを上書き
     segments = transcribe_audio(audio_path=audio_filename, language_code="ja") # 日本語を指定
+
+    # WhisperXの文字起こしをファイルに保存
+    whisper_transcription_file = save_whisper_transcription_to_file(segments, video_id)
+    print(f"📝 WhisperX文字起こしテキストを {whisper_transcription_file} に保存しました")
+
     embeddings = [embed_text(seg["text"]).squeeze() for seg in tqdm(segments, desc="📝 テキスト埋め込み中")]
     embeddings = np.stack(embeddings).astype("float32")
     save_to_faiss(embeddings, segments)
+
+    # フレームOCR処理の追加
+    video_filename = "output.mp4"
+    print("🎥 動画をダウンロード中...")
+    subprocess.run([
+        "yt-dlp",
+        "--no-cache-dir",
+        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4",
+        "-o", video_filename,
+        url
+    ])
+    print(f"✅ 動画を保存しました: {video_filename}")
+
+    print("🔍 フレームOCR処理を開始...")
+    process_video(video_filename, url)
+    print("✅ フレームOCR処理が完了しました")
+
+    # OCRの文字起こしテキストをファイルに保存
+    ocr_transcription_file = save_transcription_to_file(video_id)
+    print(f"📝 OCR文字起こしテキストを {ocr_transcription_file} に保存しました")
+
+    # 一時ファイルの削除
+    if os.path.exists(video_filename):
+        os.remove(video_filename)
+        print(f"🗑️ 一時ファイル {video_filename} を削除しました")
 
 # HNSWインデックスへの変更（精度と速度のバランス）
 def create_improved_index(embeddings):
